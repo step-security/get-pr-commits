@@ -1,0 +1,153 @@
+name: Test
+
+# Exercises the committed dist/ against the real GitHub API. The unit tests use
+# a stubbed API client, so they cannot catch a malformed request, a permission
+# the token lacks, or an output that never reaches GITHUB_OUTPUT.
+#
+# The interesting cases only exist on a pull_request event, since that is where
+# there is a pull request to read.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  read-commits:
+    name: Read the commits of this pull request
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Get the commits
+        id: unfiltered
+        uses: ./
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assert the output is a usable commit array
+        env:
+          COMMITS: ${{ steps.unfiltered.outputs.commits }}
+        run: |
+          set -eu
+          echo "$COMMITS" | jq -e 'type == "array"' > /dev/null
+          echo "$COMMITS" | jq -e 'length >= 1' > /dev/null
+
+          # Every element must carry the fields consumers actually read. A
+          # summarised or reshaped output would break them.
+          echo "$COMMITS" | jq -e 'all(has("sha") and (.commit | has("message")))' > /dev/null
+
+          echo "commits: $(echo "$COMMITS" | jq 'length')"
+          echo "$COMMITS" | jq -r '.[] | "  \(.sha[0:8]) \(.commit.message | split("\n")[0])"'
+
+      - name: Assert the commits are the ones the API reports for this PR
+        env:
+          COMMITS: ${{ steps.unfiltered.outputs.commits }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -eu
+          # Compared against the same endpoint queried independently, so a
+          # wrong pull request number or a silently truncated list is caught.
+          expected="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}/commits" --jq '[.[].sha]')"
+          actual="$(echo "$COMMITS" | jq -c '[.[].sha]')"
+
+          echo "expected: $expected"
+          echo "actual:   $actual"
+          test "$(echo "$expected" | jq -c .)" = "$actual"
+
+      - name: Get the commits with a filter that matches everything
+        id: filtered-all
+        uses: ./
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          filter_out_pattern: '[\s\S]'
+
+      - name: Assert everything was filtered out
+        env:
+          COMMITS: ${{ steps.filtered-all.outputs.commits }}
+        run: |
+          set -eu
+          # An empty array, not an unset output: the action ran and found
+          # nothing left, which is different from not having run.
+          test "$COMMITS" = "[]"
+
+      - name: Get the commits with a filter that matches nothing
+        id: filtered-none
+        uses: ./
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          filter_out_pattern: 'this-string-appears-in-no-commit-message-xyzzy'
+
+      - name: Assert the filter removed nothing
+        env:
+          ALL: ${{ steps.unfiltered.outputs.commits }}
+          FILTERED: ${{ steps.filtered-none.outputs.commits }}
+        run: |
+          set -eu
+          test "$(echo "$ALL" | jq -c '[.[].sha]')" = "$(echo "$FILTERED" | jq -c '[.[].sha]')"
+
+      - name: Fail on an invalid regex
+        id: bad-regex
+        continue-on-error: true
+        uses: ./
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          filter_out_pattern: '([unclosed'
+
+      - name: Assert the invalid regex failed the step
+        env:
+          OUTCOME: ${{ steps.bad-regex.outcome }}
+        run: |
+          set -eu
+          echo "outcome: $OUTCOME"
+          test "$OUTCOME" = "failure"
+
+  unsupported-event:
+    name: Unsupported event succeeds without an output
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run on an event that carries no pull request
+        id: wrong-event
+        uses: ./
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assert it succeeded and set no output
+        env:
+          OUTCOME: ${{ steps.wrong-event.outcome }}
+          COMMITS: ${{ steps.wrong-event.outputs.commits }}
+        run: |
+          set -eu
+          echo "outcome: $OUTCOME"
+          echo "commits: '$COMMITS'"
+
+          # Logging an error annotation but not failing is the documented
+          # behaviour, and workflows attach this to broad triggers relying on it.
+          test "$OUTCOME" = "success"
+
+          # Unset, not "[]".
+          test -z "$COMMITS"
