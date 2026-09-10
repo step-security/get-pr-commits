@@ -1,0 +1,56 @@
+name: Check dist/
+
+# The node24 runtime executes dist/index.js directly, with no install step, so
+# the committed bundle is what actually runs. If it drifts from src/, the action
+# ships behaviour nobody reviewed. This rebuilds and fails on any difference.
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  check-dist:
+    name: Check dist/
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: 'package.json'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Rebuild dist/
+        run: npm run build
+
+      - name: Compare dist/ with the committed bundle
+        run: |
+          if [ -n "$(git status --porcelain -- dist/)" ]; then
+            echo "::error::dist/ is out of date. Run 'npm run build' and commit the result."
+            git --no-pager diff --stat -- dist/
+            exit 1
+          fi
+          echo "dist/ matches src/."
